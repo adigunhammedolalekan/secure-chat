@@ -37,7 +37,6 @@ type ConnectPayload struct {
 	User string `json:"user"`
 }
 
-// publicKeyDownloadResponse
 type PublicKeyDownloadResponse struct {
 	Username string `json:"username"`
 	PublicKey string `json:"public_key"`
