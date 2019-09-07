@@ -1,29 +1,21 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"secure-chat/types"
 	"sync"
 	"time"
 )
-
-type message struct {
-	Cmd  string          `json:"cmd"`
-	Data json.RawMessage `json:"data"`
-}
-
-type serverResponse struct {
-	Type string `json:"type"`
-	Data interface{} `json:"data"`
-}
-
+// chatServer implements a secure, end-to-end encrypted chat service
 type chatServer struct {
 	address      string
 	messageSize  int
+	// user's publicKeys mapped to thier username or id
 	publicKeys   map[string]string
+	// connected users
 	conns        map[string]net.Conn
 	writeTimeOut time.Time
 	readTimeout  time.Time
@@ -40,7 +32,7 @@ func newChatServer(addr string) *chatServer {
 	s.messageSize = 1024
 	return s
 }
-
+// start a concurrent tcp chat server
 func (s *chatServer) start() error {
 	handle, err := net.Listen("tcp", s.address)
 	if err != nil {
@@ -50,13 +42,14 @@ func (s *chatServer) start() error {
 		conn, err := handle.Accept()
 		if err != nil {
 			log.Println("[TCP]: error occurred while accepting conn: ", err)
-			continue // continue waiting for other connections
+			continue // don't quit; continue waiting for other connections
 		}
 
 		go s.process(conn)
 	}
 }
 
+// process read and process messages from client/user
 func (s *chatServer) process(conn net.Conn) {
 	for {
 		buf := make([]byte, s.messageSize)
@@ -68,48 +61,52 @@ func (s *chatServer) process(conn net.Conn) {
 			log.Println("temporary connection issue: ", err)
 			continue
 		}
-
-		m := &message{}
-		if err := json.Unmarshal(buf[:], m); err != nil {
-			log.Println("a malformed json data was sent: ignoring...")
+		m := &types.Message{}
+		if err := types.GobDecode(buf[:], m); err != nil {
+			log.Println("failed to decode gob data: ", err)
 			continue
 		}
-		if m.Cmd == "register_key" {
-			type keyPayload struct {
-				User      string `json:"user"`
-				PublicKey string `json:"public_key"`
+		switch m.Cmd {
+		case "connect":
+			connect := &types.ConnectPayload{}
+			if err := types.GobDecode(m.Data, connect); err != nil {
+				log.Println("failed to convert data to ConnectPayload{}: ", err)
+				continue
 			}
-			payload := &keyPayload{}
-			if err := json.Unmarshal(m.Data, payload); err != nil {
-				log.Println("failed to process key registration data: ", err)
+			go func() {
+				// wait for user to submit their publicKey if it is not yet available.
+				// this is useful in a case whereby user1 wants to chat with user2 but user2
+				// isn't connected yet or user2 has not publish their publicKey.
+				// The loop will wait in a separate goroutine until user2 is connected and
+				// submit their publicKey, the submitted publicKey will be sent to user1 immediately
+				// so that encrypted chat can begin
+				for {
+					err := s.processConnectPayload(connect.User, conn)
+					if err == nil {
+						break
+					}else {
+						time.Sleep(300 * time.Millisecond)
+					}
+				}
+			}()
+		case "register_key":
+			payload := &types.KeyPayload{}
+			if err := types.GobDecode(m.Data, payload); err != nil {
+				log.Println("failed to convert data to KeyPayload{} ", err)
 				continue
 			}
 			s.registerKeyAndAccount(payload.User, payload.PublicKey, conn)
-		} else if m.Cmd == "send_message" {
-			type messagePayload struct {
-				User    string `json:"user"`
-				Message string `json:"message"`
-			}
-			mPayload := &messagePayload{}
-			if err := json.Unmarshal(m.Data, mPayload); err != nil {
-				log.Println("failed to process chat message: ", err)
+		case "send_message":
+			mPayload := &types.ChatPayload{}
+			if err := types.GobDecode(m.Data, mPayload); err != nil {
+				log.Println("failed to convert data to MessagePayload{}: ", err)
 				continue
 			}
-			if err := s.sendChatMessage(mPayload.User, mPayload.Message); err != nil {
+			if err := s.sendChatMessage(mPayload.Username, mPayload.Message); err != nil {
 				log.Println("failed to send message to client: ", err)
 			}
-		} else if m.Cmd == "connect" {
-			type connectPayload struct {
-				User string `json:"user"`
-			}
-			connect := &connectPayload{}
-			if err := json.Unmarshal(m.Data, connect); err != nil {
-				log.Println("failed to process connect payload: ", err)
-				continue
-			}
-			if err := s.processConnectPayload(connect.User, conn); err != nil {
-				log.Println("failed to process connect command ", err)
-			}
+		default:
+			/*no-op*/
 		}
 	}
 }
@@ -118,20 +115,36 @@ func (s *chatServer) registerKeyAndAccount(account, publicKey string, conn net.C
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
+	log.Printf("registering public key and net.Conn for account: %s", account)
 	s.publicKeys[account] = publicKey
 	s.conns[account] = conn
 }
 
-func (s *chatServer) sendChatMessage(toAccount, message string) error {
+// sendChatMessage send already encrypted chat message to `toAccount`
+// the message will be decrypted with `toAccount` privateKey on arrival
+func (s *chatServer) sendChatMessage(toAccount string, message []byte) error {
 	s.mtx.Lock()
 	conn, ok := s.conns[toAccount]
 	s.mtx.Unlock()
-
 	if !ok {
 		return fmt.Errorf("client %s not found", toAccount)
 	}
-
-	n, err := conn.Write([]byte(message))
+	log.Println("Routing message to ", toAccount)
+	m := &types.ChatPayload{
+		Username: "",
+		Message: message,
+	}
+	chatData, err := types.GobEncode(m)
+	if err != nil {
+		return err
+	}
+	srvResponse := &types.ServerResponse{Type: "message"}
+	srvResponse.Data = chatData
+	data, err := types.GobEncode(srvResponse)
+	if err != nil {
+		return err
+	}
+	n, err := conn.Write(data)
 	if err != nil {
 		return err
 	}
@@ -147,20 +160,20 @@ func (s *chatServer) processConnectPayload(account string, conn net.Conn) error 
 	if !ok {
 		return fmt.Errorf("publicKey not registered for account %s", account)
 	}
-	type response struct {
-		Account   string `json:"account"`
-		PublicKey string `json:"public_key"`
-	}
-	r := &response{
-		Account:   account,
+	r := &types.PublicKeyDownloadResponse{
+		Username:   account,
 		PublicKey: pubKey,
 	}
-	srvResponse := &serverResponse{Type: "pub_key_download", Data: r}
-	data, err := json.Marshal(srvResponse)
+	responseData, err := types.GobEncode(r)
 	if err != nil {
 		return err
 	}
-	if _, err := conn.Write(data); err != nil {
+	srvResponse := &types.ServerResponse{Type: "public_key_download", Data: responseData}
+	buffer, err := types.GobEncode(srvResponse)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.Write(buffer); err != nil {
 		log.Println("failed to pass publicKey data to client ", err)
 		return err
 	}
